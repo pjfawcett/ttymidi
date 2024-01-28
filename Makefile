@@ -1,5 +1,5 @@
-all:
-	gcc src/ttymidi.c -o ttymidi -lasound -lpthread
+|all:
+	gcc src/ttymidi.cpp -o ttymidi -lasound -lpthread
 clean:
 	rm ttymidi
 install:

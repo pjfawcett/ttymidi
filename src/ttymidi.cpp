@@ -38,6 +38,8 @@
 #define MAX_DEV_STR_LEN               32
 #define MAX_MSG_SIZE                1024
 
+#define MAX_PARAM_COUNT				2
+
 /* change this definition for the correct port */
 //#define _POSIX_SOURCE 1 /* POSIX compliant source */
 
@@ -50,8 +52,8 @@ int port_out_id;
 
 static struct argp_option options[] = 
 {
-	{"serialdevice" , 's', "DEV" , 0, "Serial device to use. Default = /dev/ttyUSB0" },
-	{"baudrate"     , 'b', "BAUD", 0, "Serial port baud rate. Default = 115200" },
+	{"serialdevice" , 's', "DEV" , 0, "Serial device to use. Default = /dev/ttyAMA0" },
+	{"baudrate"     , 'b', "BAUD", 0, "Serial port baud rate. Default = 38400" },
 	{"verbose"      , 'v', 0     , 0, "For debugging: Produce verbose output" },
 	{"printonly"    , 'p', 0     , 0, "Super debugging: Print values read from serial -- and do nothing else" },
 	{"quiet"        , 'q', 0     , 0, "Don't produce any output, even when the print command is sent" },
@@ -77,7 +79,7 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 {
 	/* Get the input argument from argp_parse, which we
 	   know is a pointer to our arguments structure. */
-	arguments_t *arguments = state->input;
+	arguments_t *arguments = (arguments_t *)(state->input);
 	int baud_temp;
 
 	switch (key)
@@ -129,12 +131,12 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 
 void arg_set_defaults(arguments_t *arguments)
 {
-	char *serialdevice_temp = "/dev/ttyUSB0";
-	arguments->printonly    = 0;
-	arguments->silent       = 0;
-	arguments->verbose      = 0;
-	arguments->baudrate     = B115200;
-	char *name_tmp		= (char *)"ttymidi";
+	const char *serialdevice_temp 	= "/dev/ttyAMA0";
+	arguments->printonly    		= 0;
+	arguments->silent       		= 0;
+	arguments->verbose      		= 0;
+	arguments->baudrate     		= B38400;
+	const char *name_tmp			= "ttymidi";
 	strncpy(arguments->serialdevice, serialdevice_temp, MAX_DEV_STR_LEN);
 	strncpy(arguments->name, name_tmp, MAX_DEV_STR_LEN);
 }
@@ -379,7 +381,7 @@ void* read_midi_from_alsa(void* seq)
 	struct pollfd* pfd;
 	snd_seq_t* seq_handle;
 
-	seq_handle = seq;
+	seq_handle = (snd_seq_t*)(seq);
 
 	npfd = snd_seq_poll_descriptors_count(seq_handle, POLLIN);
 	pfd = (struct pollfd*) alloca(npfd * sizeof(struct pollfd));
@@ -394,99 +396,165 @@ void* read_midi_from_alsa(void* seq)
 	}	
 
 	printf("\nStopping [PC]->[Hardware] communication...");
+
+	return NULL;
 }
 
-void* read_midi_from_serial_port(void* seq) 
+bool is_realtime_msg(char m)
 {
-	char buf[3], msg[MAX_MSG_SIZE];
-	int i, msglen;
-	
-	/* Lets first fast forward to first status byte... */
-	if (!arguments.printonly) {
-		do read(serial, buf, 1);
-		while (buf[0] >> 7 == 0);
+	return (m & 0xF8) == 0xF8;
+}
+
+/*
+ * The number of expected parameter bytes for the given message type
+ * 0, 1 or 2
+ * Returns -1 for variable length 'System Exclusive' message, though not 
+ * expected to be called for those
+ */
+int get_expected_param_count(char m)
+{
+	switch (m & 0xF0)
+	{
+	case 0x80:
+	case 0x90:
+	case 0xA0:
+	case 0xB0:
+	case 0xE0:
+		return 2;
+
+	case 0xC0:
+	case 0xD0:
+		return 1;
+
+	case 0xF0:
+		if (is_realtime_msg(m))
+		{
+			return 0;
+		}
+		else
+		{
+			switch (m)
+			{
+			case 0xF0:
+				return -1;
+				
+			case 0xF1:
+			case 0xF3:
+				return 1;
+
+			case 0xF2:
+				return 2;
+
+			case 0xF4:
+			case 0xF5:
+			case 0xF6:
+			case 0xF7:
+				return 0;
+			}
+		}
 	}
+
+	return 0;
+}
+
+void process_realtime_msg(char , snd_seq_t *)
+{
+// Currently just skipping Real Time messages
+}
+
+/*
+ * Read next character (and possibly print it)
+ * If it is a Real time message then process it and return True
+ * else return false
+ */
+bool read_and_check_char(char *p, snd_seq_t *seq)
+{
+	read(serial, p, 1);
+
+	if (arguments.printonly)
+	{
+		printf("%02x  ", *p);
+		fflush(stdout);
+	}
+
+	bool rt = is_realtime_msg(*p);
+
+	if (rt)
+	{
+		process_realtime_msg(*p, seq);
+	}
+
+	return rt;
+}
+
+/*
+ * Read the next 'normal' message byte from the serial port.
+ * Flow of bytes can be interrupted by single byte 'System Real Time' messages
+ * Procss those as they are found
+ * (Sound sequence device pased in in case need to process the Real Time messages)
+ */
+char get_next_msg_char(snd_seq_t *seq)
+{
+	char c;
+
+	while (read_and_check_char(&c, seq)) ;
+
+	return c;
+}
+
+void* read_midi_from_serial_port(void* seq_in) 
+{
+	snd_seq_t *seq = (snd_seq_t *)(seq_in);
+
+	char buf[1 + MAX_PARAM_COUNT];
+	int param_count;
+	int expected_param_count;
+	char &status = buf[0];	// synonym for first byte in buffer
+
+	status = 0;
 
 	while (run) 
 	{
-		/* 
-		 * super-debug mode: only print to screen whatever
-		 * comes through the serial port.
-		 */
+		char c = get_next_msg_char(seq);
 
-		if (arguments.printonly) 
+		if (c & 0x80)
 		{
-			read(serial, buf, 1);
-			printf("%x\t", (int) buf[0]&0xFF);
-			fflush(stdout);
-			continue;
+			// Status byte
+			status = c;
+			expected_param_count = get_expected_param_count(c);
+			param_count = 0;
 		}
+		else
+		{
+			// Data byte - if haven't had a status byte yet then ignore (until synced)
+			if (status)
+			{
+				++param_count;
+				buf[param_count] = c;
 
-		/* 
-		 * so let's align to the beginning of a midi command.
-		 */
-
-		int i = 1;
-
-		while (i < 3) {
-			read(serial, buf+i, 1);
-
-			if (buf[i] >> 7 != 0) {
-				/* Status byte received and will always be first bit!*/
-				buf[0] = buf[i];
-				i = 1;
-			} else {
-				/* Data byte received */
-				if (i == 2) {
-					/* It was 2nd data byte so we have a MIDI event
-					   process! */
-					i = 3;
-				} else {
-					/* Lets figure out are we done or should we read one more byte. */
-					if ((buf[0] & 0xF0) == 0xC0 || (buf[0] & 0xF0) == 0xD0) {
-						i = 3;
-					} else {
-						i = 2;
-					}
+				if (param_count == expected_param_count)
+				{
+					parse_midi_command(seq, port_out_id, buf);
+					param_count = 0;	// Re-use status byte if more parameter bytes ('running status' mode)
 				}
 			}
-
 		}
 
-		/* print comment message (the ones that start with 0xFF 0x00 0x00 */
-		if (buf[0] == (char) 0xFF && buf[1] == (char) 0x00 && buf[2] == (char) 0x00)
-		{
-			read(serial, buf, 1);
-			msglen = buf[0];
-			if (msglen > MAX_MSG_SIZE-1) msglen = MAX_MSG_SIZE-1;
+		/* TODO?: print comment message (the ones that start with 0xFF 0x00 0x00 */
 
-			read(serial, msg, msglen);
-
-			if (arguments.silent) continue;
-
-			/* make sure the string ends with a null character */
-			msg[msglen] = 0;
-
-			puts("0xFF Non-MIDI message: ");
-			puts(msg);
-			putchar('\n');
-			fflush(stdout);
-		}
-
-		/* parse MIDI message */
-		else parse_midi_command(seq, port_out_id, buf);
 	}
+
+	return NULL;
 }
 
 /* --------------------------------------------------------------------- */
 // Main program
 
-main(int argc, char** argv)
+int main(int argc, char** argv)
 {
 	//arguments arguments;
 	struct termios oldtio, newtio;
 	struct serial_struct ser_info;
-	char* modem_device = "/dev/ttyS0";
 	snd_seq_t *seq;
 
 	arg_set_defaults(&arguments);

@@ -293,11 +293,12 @@ void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
 		{
 
 			case SND_SEQ_EVENT_NOTEOFF: 
-				bytes[0] = 0x80 + ev->data.control.channel;
+			// Use "Note On" with zero velocity
+				bytes[0] = 0x90 + ev->data.control.channel;
 				bytes[1] = ev->data.note.note;
-				bytes[2] = ev->data.note.velocity;        
+				bytes[2] = 0;
 				if (!arguments.silent && arguments.verbose) 
-					printf("Alsa    0x%x Note off           %03u %03u %03u\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]); 
+					printf("Alsa    0x%x Note on (off)      %03u %03u %03u\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]); 
 				break; 
 
 			case SND_SEQ_EVENT_NOTEON:
